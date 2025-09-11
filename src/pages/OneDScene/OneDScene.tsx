@@ -94,9 +94,7 @@ const OneDScene: React.FC = () => {
                         return { samples: base, extraSamples: boSamples, revealedPoints: revealed };
             }, [currentStep]);
         // Use all currently revealed points, sorted by x for interpolation stability
-        const sortedPoints = useMemo(() => revealedPoints.slice().sort((a,b)=>a.x-b.x), [revealedPoints]);
-        const xs = sortedPoints.map(p => p.x);
-        const ys = sortedPoints.map(p => p.y as number);
+    const sortedPoints = useMemo(() => revealedPoints.slice().sort((a,b)=>a.x-b.x), [revealedPoints]);
 
         // Interpolation visibility toggle (auto logic + user override)
             const [showInterpolation, setShowInterpolation] = useState(false);
@@ -146,11 +144,15 @@ const OneDScene: React.FC = () => {
         }, [currentStep]);
 
     const interpCurve = useMemo(() => {
+            // Compute xs/ys here so this memo depends only on sortedPoints (stable),
+            // avoiding re-creation every render that would restart the tween.
             if (!showInterpolation || currentStep < 5 || sortedPoints.length < 2) return null;
-        const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
-        const yVals = linearInterpolation1D(xs, ys, grid);
-        return { grid, yVals };
-        }, [showInterpolation, currentStep, xs, ys, sortedPoints.length]);
+            const xs = sortedPoints.map(p => p.x);
+            const ys = sortedPoints.map(p => p.y as number);
+            const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
+            const yVals = linearInterpolation1D(xs, ys, grid);
+            return { grid, yVals };
+        }, [showInterpolation, currentStep, sortedPoints]);
 
         // True GPR prediction
             const gprCurve = useMemo(() => {
@@ -483,7 +485,8 @@ const OneDScene: React.FC = () => {
                 {/* Linear interpolation */}
             {interpMounted && (
                 (() => {
-                    const src = interpDisplay ?? (interpVisible ? interpCurve : lastInterpRef.current);
+                    // Prefer last known curve while tween initializes to prevent an instant jump to end state
+                    const src = interpDisplay ?? lastInterpRef.current ?? (interpVisible ? interpCurve : null);
                     if (!src) return null;
                     return (
                         <polyline
