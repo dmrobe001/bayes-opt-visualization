@@ -3,6 +3,7 @@ import usePresentation from '../../hooks/usePresentation';
 import { linearInterpolation1D } from '../../algorithms/interpolation/linear1D';
 import { toyFunction1D } from '../../data/toyFunctions';
 import { GaussianProcessRegression } from '../../algorithms/gpr/gpr';
+import TimelineScrubber from '../../components/Timeline/TimelineScrubber';
 // Placeholder imports – to be implemented
 // import { GaussianProcess } from '../../algorithms/gpr/gpr';
 
@@ -21,38 +22,28 @@ interface SamplePoint { x: number; y?: number; revealed: boolean; }
 
 const buildInitialSamples = (): SamplePoint[] => INITIAL_X.map(x => ({ x, revealed: false }));
 
-const totalSteps = 11; // 0..10 inclusive
+// Central authority for number of steps (inclusive range 0..N-1)
+const totalSteps = 11;
 
 const OneDScene: React.FC = () => {
-    const { currentStep, nextStep } = usePresentation(totalSteps);
-    const [samples, setSamples] = useState<SamplePoint[]>(() => buildInitialSamples());
-    const [extraSamples, setExtraSamples] = useState<SamplePoint[]>([]);
+        const { currentStep, nextStep, setCurrentStep } = usePresentation(totalSteps);
 
-    // Derive which samples should be revealed based on currentStep
-    useMemo(() => {
-        const primaryRevealCount = Math.min(Math.max(currentStep, 0), 4); // steps 0-4 control reveals
-        setSamples(prev => prev.map((s, i) => {
-            if (i < primaryRevealCount) {
-                if (!s.revealed) {
-                    return { ...s, revealed: true, y: toyFunction1D(s.x) };
-                }
-                return s;
+        // Pure reconstruction of state from step index (enables scrubbing & replay)
+        const { samples, extraSamples, revealedPoints } = useMemo(() => {
+            const base = buildInitialSamples();
+            const primaryRevealCount = Math.min(Math.max(currentStep, 0), 4);
+            for (let i = 0; i < primaryRevealCount; i++) {
+                base[i].revealed = true;
+                base[i].y = toyFunction1D(base[i].x);
             }
-            return { ...s, revealed: false, y: s.revealed ? s.y : undefined };
-        }));
-    }, [currentStep]);
-
-    // Handle EI-added points for steps 7-10 (indices 0-3 of EXTRA_X)
-    useMemo(() => {
-        if (currentStep < 7) {
-            if (extraSamples.length) setExtraSamples([]);
-            return;
-        }
-        const count = Math.min(currentStep - 6, EXTRA_X.length); // step 7 ->1 point
-        setExtraSamples(EXTRA_X.slice(0, count).map(x => ({ x, revealed: true, y: toyFunction1D(x) })));
-    }, [currentStep]);
-
-    const revealedPoints = [...samples, ...extraSamples].filter(p => p.revealed && p.y !== undefined);
+            let extras: SamplePoint[] = [];
+            if (currentStep >= 7) {
+                const count = Math.min(currentStep - 6, EXTRA_X.length);
+                extras = EXTRA_X.slice(0, count).map(x => ({ x, revealed: true, y: toyFunction1D(x) }));
+            }
+            const revealed = [...base, ...extras].filter(p => p.revealed && p.y !== undefined);
+            return { samples: base, extraSamples: extras, revealedPoints: revealed };
+        }, [currentStep]);
     const xs = revealedPoints.map(p => p.x);
     const ys = revealedPoints.map(p => p.y as number);
 
@@ -75,14 +66,19 @@ const OneDScene: React.FC = () => {
             return { grid, yMean: pred.mean, variance: pred.variance.map(v => Math.sqrt(v)) };
         }, [currentStep, revealedPoints]);
 
-    const handleAdvance = useCallback(() => {
-        nextStep();
-    }, [nextStep]);
+        const handleAdvance = useCallback(() => {
+            nextStep();
+        }, [nextStep]);
+
+        const handleScrub = useCallback((s: number) => setCurrentStep(s), [setCurrentStep]);
 
     return (
         <div className="one-d-scene" onClick={handleAdvance} style={{ cursor: 'pointer' }}>
-            <h2>1D Bayesian Optimization (Prototype Sequence)</h2>
-            <p style={{ fontSize: '0.85rem', color: '#666' }}>Click to advance step {currentStep}/{totalSteps - 1}</p>
+                    <h2>1D Bayesian Optimization (Prototype Sequence)</h2>
+                    <p style={{ fontSize: '0.85rem', color: '#666' }}>Click canvas or use timeline. Step {currentStep}/{totalSteps - 1}</p>
+                    <div style={{ maxWidth: 820, marginBottom: '0.5rem' }}>
+                        <TimelineScrubber currentStep={currentStep} totalSteps={totalSteps} onStepChange={handleScrub} />
+                    </div>
             <svg viewBox="0 0 100 60" width="800" height="480" style={{ background: '#fafafa', border: '1px solid #ccc' }}>
                 {/* Axes */}
                 <line x1={5} y1={50} x2={95} y2={50} stroke="#0b61ff" strokeWidth={1.5} />

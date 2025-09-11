@@ -50,6 +50,7 @@ const usePresentation = (totalSteps: number) => {
         play,
         pause,
         reset,
+        setCurrentStep, // expose for timeline scrubbing
     };
 };
 
