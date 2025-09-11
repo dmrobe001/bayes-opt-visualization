@@ -130,6 +130,20 @@ const OneDScene: React.FC = () => {
             setShowInterpolation(e.target.checked);
         };
 
+        // Reset current step UI to defaults (revert user overrides)
+        const resetStep = useCallback(() => {
+            userToggledRef.current = false;
+            // Interpolation defaults by step
+            if (currentStep < 5) setShowInterpolation(false);
+            else if (currentStep === 5) setShowInterpolation(true);
+            else setShowInterpolation(false);
+            // GPR visibility defaults
+            setShowGPRMean(currentStep >= 6);
+            setShowGPRVar(currentStep >= 6);
+            // EI default is off
+            setShowEI(false);
+        }, [currentStep]);
+
         const interpCurve = useMemo(() => {
             if (!showInterpolation || currentStep < 5 || sortedPoints.length < 2) return null;
         const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
@@ -258,8 +272,16 @@ const OneDScene: React.FC = () => {
                                                         onChange={e => { e.stopPropagation(); setShowGPRVar(e.target.checked); }}
                                                         disabled={currentStep < 6}
                                                     />
-                                                    GPR variance
+                                                    GPR ±σ
                                                 </label>
+                                                <button
+                                                    onClick={e => { e.stopPropagation(); resetStep(); }}
+                                                    onMouseDown={e => e.stopPropagation()}
+                                                    style={{ marginLeft: '0.75rem', fontSize: '0.72rem', padding: '0.2rem 0.5rem', cursor: 'pointer' }}
+                                                    title="Revert user changes and restore defaults for this step"
+                                                >
+                                                    Reset step
+                                                </button>
                                                         <label
                                                             onClick={e => e.stopPropagation()}
                                                             onMouseDown={e => e.stopPropagation()}
