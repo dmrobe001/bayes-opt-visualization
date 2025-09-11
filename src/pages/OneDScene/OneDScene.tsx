@@ -2,6 +2,7 @@ import React, { useState, useMemo, useCallback } from 'react';
 import usePresentation from '../../hooks/usePresentation';
 import { linearInterpolation1D } from '../../algorithms/interpolation/linear1D';
 import { toyFunction1D } from '../../data/toyFunctions';
+import { GaussianProcessRegression } from '../../algorithms/gpr/gpr';
 // Placeholder imports – to be implemented
 // import { GaussianProcess } from '../../algorithms/gpr/gpr';
 
@@ -62,25 +63,17 @@ const OneDScene: React.FC = () => {
         return { grid, yVals };
     }, [currentStep, xs, ys, revealedPoints.length]);
 
-    // Placeholder GPR prediction (use simple moving average + distance-based variance for now)
-    const gprCurve = useMemo(() => {
-        if (currentStep < 6 || revealedPoints.length < 2) return null;
-        const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
-        const yMean = grid.map(gx => {
-            // nearest neighbor smooth average of k closest
-            const k = 3;
-            const sorted = revealedPoints
-                .map(p => ({ d: Math.abs(p.x - gx), y: p.y! }))
-                .sort((a, b) => a.d - b.d)
-                .slice(0, Math.min(k, revealedPoints.length));
-            return sorted.reduce((acc, v) => acc + v.y, 0) / sorted.length;
-        });
-        const variance = grid.map(gx => {
-            const nearest = revealedPoints.reduce((min, p) => Math.min(min, Math.abs(p.x - gx)), Infinity);
-            return Math.min(0.2, nearest * 0.4); // crude distance-based variance
-        });
-        return { grid, yMean, variance };
-    }, [currentStep, revealedPoints]);
+        // True GPR prediction
+        const gprCurve = useMemo(() => {
+            if (currentStep < 6 || revealedPoints.length < 2) return null;
+            const gp = new GaussianProcessRegression({ lengthScale: 0.25, noise: 1e-3, signalVariance: 1 });
+            const X = revealedPoints.map(p => [p.x]);
+            const yv = revealedPoints.map(p => p.y!);
+            gp.fit(X, yv);
+            const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
+            const pred = gp.predict(grid.map(g => [g]));
+            return { grid, yMean: pred.mean, variance: pred.variance.map(v => Math.sqrt(v)) };
+        }, [currentStep, revealedPoints]);
 
     const handleAdvance = useCallback(() => {
         nextStep();
