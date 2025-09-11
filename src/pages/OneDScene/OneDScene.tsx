@@ -26,6 +26,7 @@ const totalSteps = 11;
 
 const OneDScene: React.FC = () => {
         const { currentStep, nextStep, setCurrentStep } = usePresentation(totalSteps);
+    const TRANS_MS = 350;
 
         // Pure reconstruction of state from step index (enables scrubbing & replay)
                 const { samples, extraSamples, revealedPoints } = useMemo(() => {
@@ -144,7 +145,7 @@ const OneDScene: React.FC = () => {
             setShowEI(false);
         }, [currentStep]);
 
-        const interpCurve = useMemo(() => {
+    const interpCurve = useMemo(() => {
             if (!showInterpolation || currentStep < 5 || sortedPoints.length < 2) return null;
         const grid: number[] = Array.from({ length: 101 }, (_, i) => i / 100);
         const yVals = linearInterpolation1D(xs, ys, grid);
@@ -162,6 +163,136 @@ const OneDScene: React.FC = () => {
             const pred = gp.predict(grid.map(g => [g]));
             return { grid, yMean: pred.mean, variance: pred.variance.map(v => Math.sqrt(v)) };
         }, [currentStep, revealedPoints]);
+
+        // Cache last geometry so we can animate out when hidden
+    const lastInterpRef = useRef<{ grid: number[]; yVals: number[] } | null>(null);
+    const lastGprRef = useRef<{ grid: number[]; yMean: number[]; variance: number[] } | null>(null);
+    const lastEiRef = useRef<{ grid: number[]; scaled: number[]; raw: number[] } | null>(null);
+
+        // Presence + animated visibility for each overlay
+        const interpVisible = !!(showInterpolation && currentStep >= 5);
+        const gprMeanVisible = !!(showGPRMean && currentStep >= 6);
+        const gprVarVisible = !!(showGPRVar && currentStep >= 6);
+        const eiVisible = !!(showEI && currentStep >= 6);
+
+        const [interpMounted, setInterpMounted] = useState(false);
+        const [gprMeanMounted, setGprMeanMounted] = useState(false);
+        const [gprVarMounted, setGprVarMounted] = useState(false);
+        const [eiMounted, setEiMounted] = useState(false);
+        const [interpIn, setInterpIn] = useState(false);
+        const [gprMeanIn, setGprMeanIn] = useState(false);
+        const [gprVarIn, setGprVarIn] = useState(false);
+        const [eiIn, setEiIn] = useState(false);
+
+        useEffect(() => {
+            if (interpVisible) {
+                setInterpMounted(true);
+                setInterpIn(false);
+                const id = requestAnimationFrame(() => setInterpIn(true));
+                return () => cancelAnimationFrame(id);
+            } else {
+                setInterpIn(false);
+                const t = setTimeout(() => setInterpMounted(false), TRANS_MS);
+                return () => clearTimeout(t);
+            }
+        }, [interpVisible]);
+        useEffect(() => {
+            if (gprMeanVisible) {
+                setGprMeanMounted(true);
+                setGprMeanIn(false);
+                const id = requestAnimationFrame(() => setGprMeanIn(true));
+                return () => cancelAnimationFrame(id);
+            } else {
+                setGprMeanIn(false);
+                const t = setTimeout(() => setGprMeanMounted(false), TRANS_MS);
+                return () => clearTimeout(t);
+            }
+        }, [gprMeanVisible]);
+        useEffect(() => {
+            if (gprVarVisible) {
+                setGprVarMounted(true);
+                setGprVarIn(false);
+                const id = requestAnimationFrame(() => setGprVarIn(true));
+                return () => cancelAnimationFrame(id);
+            } else {
+                setGprVarIn(false);
+                const t = setTimeout(() => setGprVarMounted(false), TRANS_MS);
+                return () => clearTimeout(t);
+            }
+        }, [gprVarVisible]);
+        useEffect(() => {
+            if (eiVisible) {
+                setEiMounted(true);
+                setEiIn(false);
+                const id = requestAnimationFrame(() => setEiIn(true));
+                return () => cancelAnimationFrame(id);
+            } else {
+                setEiIn(false);
+                const t = setTimeout(() => setEiMounted(false), TRANS_MS);
+                return () => clearTimeout(t);
+            }
+        }, [eiVisible]);
+
+        const curveAnimStyle = (vis: boolean) => ({
+            opacity: vis ? 1 : 0,
+            transform: `scaleY(${vis ? 1 : 0})`,
+            transition: `opacity ${TRANS_MS}ms ease, transform ${TRANS_MS}ms ease`,
+            transformOrigin: '0px 50px', // x-axis at y=50
+            transformBox: 'view-box' as any,
+        });
+
+        // Tweened display states for smooth morphs
+        const [interpDisplay, setInterpDisplay] = useState<{ grid: number[]; yVals: number[] } | null>(null);
+        const [gprDisplay, setGprDisplay] = useState<{ grid: number[]; yMean: number[]; variance: number[] } | null>(null);
+        const [eiDisplay, setEiDisplay] = useState<{ grid: number[]; scaled: number[] } | null>(null);
+
+        // Animate interpolation curve to new values
+        useEffect(() => {
+            if (!interpCurve) return;
+            const last = lastInterpRef.current;
+            const startVals = last?.yVals ?? Array(interpCurve.grid.length).fill(-1);
+            const endVals = interpCurve.yVals;
+            let raf = 0; let t0: number | null = null;
+            const step = (t: number) => {
+                if (t0 === null) t0 = t;
+                const p = Math.min(1, (t - t0) / TRANS_MS);
+                const e = p * (2 - p);
+                const yVals = endVals.map((v, i) => startVals[i] + (v - startVals[i]) * e);
+                setInterpDisplay({ grid: interpCurve.grid, yVals });
+                if (p < 1) raf = requestAnimationFrame(step);
+            };
+            raf = requestAnimationFrame(step);
+            return () => cancelAnimationFrame(raf);
+        }, [interpCurve]);
+
+        // Animate GPR mean and sigma
+        useEffect(() => {
+            if (!gprCurve) return;
+            const last = lastGprRef.current;
+            const n = gprCurve.grid.length;
+            const startMean = last?.yMean ?? Array(n).fill(-1);
+            const startVar = last?.variance ?? Array(n).fill(0);
+            const endMean = gprCurve.yMean;
+            const endVar = gprCurve.variance;
+            let raf = 0; let t0: number | null = null;
+            const step = (t: number) => {
+                if (t0 === null) t0 = t;
+                const p = Math.min(1, (t - t0) / TRANS_MS);
+                const e = p * (2 - p);
+                const yMean = endMean.map((v, i) => startMean[i] + (v - startMean[i]) * e);
+                const variance = endVar.map((v, i) => startVar[i] + (v - startVar[i]) * e);
+                setGprDisplay({ grid: gprCurve.grid, yMean, variance });
+                if (p < 1) raf = requestAnimationFrame(step);
+            };
+            raf = requestAnimationFrame(step);
+            return () => cancelAnimationFrame(raf);
+        }, [gprCurve]);
+
+    // Update last known interpolation AFTER tween so it serves as start of next morph
+    useEffect(() => { if (interpCurve) lastInterpRef.current = interpCurve; }, [interpCurve]);
+
+    // Update last known GPR AFTER tween so it serves as start of next morph
+    useEffect(() => { if (gprCurve) lastGprRef.current = gprCurve; }, [gprCurve]);
 
                 // Expected Improvement (EI) calculation (maximization). Scaled to [-1, 0] for display; toggle controlled.
                         const eiCurve = useMemo(() => {
@@ -191,6 +322,26 @@ const OneDScene: React.FC = () => {
                             const scaled = raw.map(v => maxEI > 0 ? (v / maxEI) - 1 : -1);
                             return { grid, scaled, raw };
                         }, [currentStep, revealedPoints]);
+    useEffect(() => { if (eiCurve) lastEiRef.current = eiCurve; }, [eiCurve]);
+
+        // Animate EI curve
+        useEffect(() => {
+            if (!eiCurve) return;
+            const last = lastEiRef.current;
+            const start = last?.scaled ?? Array(eiCurve.grid.length).fill(-1);
+            const end = eiCurve.scaled;
+            let raf = 0; let t0: number | null = null;
+            const step = (t: number) => {
+                if (t0 === null) t0 = t;
+                const p = Math.min(1, (t - t0) / TRANS_MS);
+                const e = p * (2 - p);
+                const scaled = end.map((v, i) => start[i] + (v - start[i]) * e);
+                setEiDisplay({ grid: eiCurve.grid, scaled });
+                if (p < 1) raf = requestAnimationFrame(step);
+            };
+            raf = requestAnimationFrame(step);
+            return () => cancelAnimationFrame(raf);
+        }, [eiCurve]);
 
             // Color scaling: darkest (black) at min, vivid red at max, gradient in between
             const colorForY = (y?: number) => {
@@ -313,59 +464,95 @@ const OneDScene: React.FC = () => {
                     const xPos = 5 + s.x * 90;
                     const yPos = s.revealed && s.y !== undefined ? 50 - (s.y + 1) * 20 : 50; // normalize y ~[-1,1]
                             const fill = s.revealed && s.y !== undefined ? colorForY(s.y) : '#000';
-                            return <circle key={i} cx={xPos} cy={yPos} r={1.5} fill={fill} stroke="#111" strokeWidth={0.4} />;
+                            return (
+                                <g key={i} transform={`translate(${xPos},${yPos})`} style={{ transition: `transform ${TRANS_MS}ms ease` }}>
+                                    <circle cx={0} cy={0} r={1.5} fill={fill} stroke="#111" strokeWidth={0.4} />
+                                </g>
+                            );
                 })}
                 {/* Extra BO samples */}
                 {extraSamples.map((s, i) => {
                     const xPos = 5 + s.x * 90;
                     const yPos = s.y !== undefined ? 50 - (s.y + 1) * 20 : 50;
-                            return <circle key={`e-${i}`} cx={xPos} cy={yPos} r={1.4} fill={colorForY(s.y)} stroke="#300" strokeWidth={0.35} />;
+                            return (
+                                <g key={`e-${i}`} transform={`translate(${xPos},${yPos})`} style={{ transition: `transform ${TRANS_MS}ms ease` }}>
+                                    <circle cx={0} cy={0} r={1.4} fill={colorForY(s.y)} stroke="#300" strokeWidth={0.35} />
+                                </g>
+                            );
                 })}
                 {/* Linear interpolation */}
-            {interpCurve && showInterpolation && (
-                    <polyline
-                        points={interpCurve.grid.map((g, idx) => `${5 + g * 90},${50 - (interpCurve.yVals[idx] + 1) * 20}`).join(' ')}
-                        fill="none"
-                stroke="#555"
-                strokeDasharray="3 2"
-                strokeWidth={0.7}
-                    />
-                )}
-                {/* GPR mean */}
-            {gprCurve && showGPRMean && (
-                    <polyline
-                        points={gprCurve.grid.map((g, idx) => `${5 + g * 90},${50 - (gprCurve.yMean[idx] + 1) * 20}`).join(' ')}
-                        fill="none"
-                stroke="#c00000"
-                strokeWidth={0.9}
-                    />
-                )}
-                {/* Variance band */}
-            {gprCurve && showGPRVar && (
-                    <polygon
-                        points={[
-                            ...gprCurve.grid.map((g, idx) => `${5 + g * 90},${50 - (gprCurve.yMean[idx] + gprCurve.variance[idx] + 1) * 20}`),
-                            ...gprCurve.grid
-                                .slice()
-                                .reverse()
-                                .map((g, ri) => {
-                                    const idx = gprCurve.grid.length - 1 - ri;
-                                    return `${5 + g * 90},${50 - (gprCurve.yMean[idx] - gprCurve.variance[idx] + 1) * 20}`;
-                                }),
-                        ].join(' ')}
-                fill="rgba(220,0,0,0.08)"
-                        stroke="none"
-                    />
-                )}
-                    {/* Expected Improvement (scaled) */}
-                    {eiCurve && showEI && (
+            {interpMounted && (
+                (() => {
+                    const src = interpDisplay ?? (interpVisible ? interpCurve : lastInterpRef.current);
+                    if (!src) return null;
+                    return (
                         <polyline
-                            points={eiCurve.grid.map((g, idx) => `${5 + g * 90},${50 - (eiCurve.scaled[idx] + 1) * 20}`).join(' ')}
+                            points={src.grid.map((g, idx) => `${5 + g * 90},${50 - (src.yVals[idx] + 1) * 20}`).join(' ')}
                             fill="none"
-                            stroke="#ff9500"
-                            strokeWidth={0.8}
-                            strokeDasharray="2 2"
+                            stroke="#555"
+                            strokeDasharray="3 2"
+                            strokeWidth={0.7}
+                            style={curveAnimStyle(interpIn)}
                         />
+                    );
+                })()
+            )}
+                {/* GPR mean */}
+            {gprMeanMounted && (
+                (() => {
+                    const src = gprDisplay ?? (gprMeanVisible ? gprCurve : lastGprRef.current);
+                    if (!src) return null;
+                    return (
+                        <polyline
+                            points={src.grid.map((g, idx) => `${5 + g * 90},${50 - (src.yMean[idx] + 1) * 20}`).join(' ')}
+                            fill="none"
+                            stroke="#c00000"
+                            strokeWidth={0.9}
+                            style={curveAnimStyle(gprMeanIn)}
+                        />
+                    );
+                })()
+            )}
+                {/* Variance band */}
+            {gprVarMounted && (
+                (() => {
+                    const src = gprDisplay ?? (gprVarVisible ? gprCurve : lastGprRef.current);
+                    if (!src) return null;
+                    return (
+                        <polygon
+                            points={[
+                                ...src.grid.map((g, idx) => `${5 + g * 90},${50 - (src.yMean[idx] + src.variance[idx] + 1) * 20}`),
+                                ...src.grid
+                                    .slice()
+                                    .reverse()
+                                    .map((g, ri) => {
+                                        const idx = src.grid.length - 1 - ri;
+                                        return `${5 + g * 90},${50 - (src.yMean[idx] - src.variance[idx] + 1) * 20}`;
+                                    }),
+                            ].join(' ')}
+                            fill="rgba(220,0,0,0.08)"
+                            stroke="none"
+                            style={curveAnimStyle(gprVarIn)}
+                        />
+                    );
+                })()
+            )}
+                    {/* Expected Improvement (scaled) */}
+                    {eiMounted && (
+                        (() => {
+                            const src = eiDisplay ?? (eiVisible ? eiCurve : lastEiRef.current);
+                            if (!src) return null;
+                            return (
+                                <polyline
+                                    points={src.grid.map((g, idx) => `${5 + g * 90},${50 - (src.scaled[idx] + 1) * 20}`).join(' ')}
+                                    fill="none"
+                                    stroke="#ff9500"
+                                    strokeWidth={0.8}
+                                    strokeDasharray="2 2"
+                                    style={curveAnimStyle(eiIn)}
+                                />
+                            );
+                        })()
                     )}
             </svg>
             {/* Removed descriptive list now that labels are on the timeline */}
