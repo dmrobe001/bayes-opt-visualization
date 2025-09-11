@@ -1,0 +1,34 @@
+{
+  "name": "bayes-opt-visualization",
+  "version": "1.0.0",
+  "description": "An interactive demo for Bayesian optimization and experimental design exploration.",
+  "main": "src/main.tsx",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "vite preview",
+    "test": "jest"
+  },
+  "dependencies": {
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "three": "^0.132.2",
+    "@types/react": "^17.0.2",
+    "@types/react-dom": "^17.0.2"
+  },
+  "devDependencies": {
+    "typescript": "^4.4.3",
+    "vite": "^2.5.0",
+    "jest": "^27.0.6",
+    "@vitejs/plugin-react": "^1.0.0"
+  },
+  "keywords": [
+    "bayesian",
+    "optimization",
+    "visualization",
+    "react",
+    "three.js"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
