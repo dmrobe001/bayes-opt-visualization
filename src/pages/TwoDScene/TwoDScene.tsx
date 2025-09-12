@@ -2,13 +2,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three';
 import TimelineScrubber from '../../components/Timeline/TimelineScrubber';
 import usePresentation from '../../hooks/usePresentation';
-import { toyFunction2D } from '../../data/toyFunctions';
+import { toyFunction2D_bimodal as toyFunction2D } from '../../data/toyFunctions';
 import { Controls } from '../../rendering/three/controls';
+import { GaussianProcessRegression } from '../../algorithms/gpr/gpr';
 
 type Pt = { x: number; y: number; z: number };
 
 const TRANS_MS = 500;
-const TOTAL_STEPS = 5; // 0:init, 1:reveal z+color, 2:tilt+rotate, 3:tri mesh, 4:hold
+const TOTAL_STEPS = 9; // 0:Factorial, 1:Initial, 2:Linear, 3:GPR, 4:EI, 5:BO 1, 6:BO 2, 7:BO 3, 8:BO 4
 
 const TwoDScene: React.FC = () => {
     const { currentStep, nextStep, setCurrentStep } = usePresentation(TOTAL_STEPS);
@@ -19,6 +20,8 @@ const TwoDScene: React.FC = () => {
     const controlsRef = useRef<Controls>();
     const draggingRef = useRef(false);
     const rafRef = useRef<number>();
+    const pointerDownRef = useRef<{ x: number; y: number } | null>(null);
+    const pointerMovedRef = useRef(false);
 
     const rows = 4, cols = 4;
     const gridPts = useMemo<Pt[]>(() => {
@@ -39,14 +42,98 @@ const TwoDScene: React.FC = () => {
         const zs = gridPts.map(p => p.z);
         return { zMin: Math.min(...zs), zMax: Math.max(...zs) };
     }, [gridPts]);
-    // Normalize z to [0,1] for elevation and color
+    // Normalize z to [0,1] only for coloring; keep true z for geometry
     const norm01 = useMemo(() => gridPts.map(p => ({ x: p.x, y: p.y, z01: zMax === zMin ? 0 : (p.z - zMin) / (zMax - zMin) })), [gridPts, zMin, zMax]);
 
     // Step-driven display state
-    const showZ = currentStep >= 1;
-    const showTilt = currentStep >= 2;
-    const showMesh = currentStep >= 3;
-    const zScale = 0.3; // world units height for max z
+    const showZ = currentStep >= 1; // Step 1+: points at true Z
+    const showTilt = currentStep >= 2; // Step 2+: camera tilt and rotation begin
+    const zScale = 0.3; // world units height for max z on the axis drawing
+    const worldZ = useCallback((zVal: number) => {
+        if (!isFinite(zVal) || !isFinite(zMin) || !isFinite(zMax) || zMax === zMin) return 0;
+        // Map zMin->0, zMax->zScale, but do NOT clamp so values can exceed the axis
+        return ((zVal - zMin) / (zMax - zMin)) * zScale;
+    }, [zMin, zMax]);
+
+    // Overlay toggles (will be driven by step changes; UI can temporarily override within a step)
+    const [showLinear, setShowLinear] = useState(false);
+    const [showGPRMean, setShowGPRMean] = useState(false);
+    const [showGPRSigma, setShowGPRSigma] = useState(false);
+    const [showEI, setShowEI] = useState(false);
+
+    // Align overlays to the current step
+    useEffect(() => {
+        // Step mapping:
+        // 0: Factorial Sampling -> no surfaces
+        // 1: Initial Measurements -> no surfaces
+        // 2: Linear -> linear only
+        // 3: GPR -> GPR mean + sigma
+        // 4: EI -> sigma + EI (mean hidden)
+        // 5: BO 1 -> sigma + EI (updated after new sample)
+        setShowLinear(currentStep === 2);
+        setShowGPRMean(currentStep === 3);
+        setShowGPRSigma(currentStep >= 3);
+        setShowEI(currentStep >= 4);
+    }, [currentStep]);
+
+    // Rotate toggle: user-controlled, with step-based auto-enable
+    const [rotateEnabled, setRotateEnabled] = useState(false);
+    const userSetRotateRef = useRef(false);
+
+    // Samples (start with grid samples). Keep in state so overlays recompute automatically on updates.
+    const [samples, setSamples] = useState(() => gridPts.map(p => ({ x: p.x, y: p.y, z: p.z })));
+    useEffect(() => {
+        // If underlying grid changes (unlikely), reset samples to the new grid
+        setSamples(gridPts.map(p => ({ x: p.x, y: p.y, z: p.z })));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [gridPts]);
+
+    // Dense evaluation grid for GP/EI
+    const gridRes = 41;
+    const evalGrid = useMemo(() => {
+        const xs = Array.from({ length: gridRes }, (_, i) => i / (gridRes - 1));
+        const ys = Array.from({ length: gridRes }, (_, j) => j / (gridRes - 1));
+        const Xs: number[][] = [];
+        for (let j = 0; j < gridRes; j++) {
+            for (let i = 0; i < gridRes; i++) Xs.push([xs[i], ys[j]]);
+        }
+        return { xs, ys, Xs };
+    }, []);
+
+    // GP fit and prediction over dense grid
+    const gpPred = useMemo(() => {
+        if (samples.length < 3) return null;
+        const gp = new GaussianProcessRegression({ lengthScale: 0.25, noise: 1e-3, signalVariance: 1 });
+        gp.fit(samples.map(s => [s.x, s.y]), samples.map(s => s.z));
+        const pred = gp.predict(evalGrid.Xs);
+        const sigma = pred.variance.map(v => Math.sqrt(Math.max(v, 0)));
+        return { mean: pred.mean, sigma };
+    }, [samples, evalGrid]);
+
+    // Expected Improvement field (normalized 0..1)
+    const eiField = useMemo(() => {
+        if (!gpPred || samples.length < 2) return null;
+        const best = Math.max(...samples.map(s => s.z));
+        const xi = 0.0;
+        const phi = (z: number) => Math.exp(-0.5 * z * z) / Math.sqrt(2 * Math.PI);
+        const erf = (x: number) => {
+            const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741, a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+            const sign = x < 0 ? -1 : 1; const ax = Math.abs(x);
+            const t = 1 / (1 + p * ax);
+            const y = 1 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * Math.exp(-ax * ax);
+            return sign * y;
+        };
+        const Phi = (z: number) => 0.5 * (1 + erf(z / Math.SQRT2));
+        const raw = gpPred.mean.map((mu, i) => {
+            const s = gpPred.sigma[i];
+            if (s < 1e-9) return 0;
+            const z = (mu - best - xi) / s;
+            return (mu - best - xi) * Phi(z) + s * phi(z);
+        });
+        const maxEI = Math.max(...raw);
+        const norm = raw.map(v => maxEI > 0 ? v / maxEI : 0);
+        return { raw, norm };
+    }, [gpPred, samples]);
 
     // Animated tilt (camera interpolation 0 -> 1)
     const [tilt, setTilt] = useState(0);
@@ -67,19 +154,35 @@ const TwoDScene: React.FC = () => {
     // Pause auto-rotation on interaction
     const [userPaused, setUserPaused] = useState(false);
 
+    // Auto-enable rotate at the "tilt + rotate" step unless the user has explicitly set it
+    useEffect(() => {
+        if (currentStep >= 2 && !userSetRotateRef.current) {
+            setRotateEnabled(true);
+        }
+    }, [currentStep]);
+
     const labels = [
-        '2D grid',
-        'apply z + color',
-        'tilt + rotate',
-        'triangulated mesh',
-        'hold',
+        'Factoral Sampling',
+        'Initial Measurements',
+        'Linear',
+        'GPR',
+        'EI',
+        'BO 1',
+        'BO 2',
+        'BO 3',
+        'BO 4',
     ];
 
         const handleAdvance = () => { setUserPaused(false); nextStep(); };
 
         // Three.js scene setup
     const pointsRef = useRef<THREE.Points>();
-    const meshRef = useRef<THREE.Mesh>();
+        const pointsBorderRef = useRef<THREE.Points>();
+    const linearRef = useRef<THREE.Mesh>();
+    const gprMeanRef = useRef<THREE.Mesh>();
+    const gprSigmaUpRef = useRef<THREE.Mesh>();
+    const gprSigmaDnRef = useRef<THREE.Mesh>();
+    const eiRef = useRef<THREE.Mesh>();
     const axesRef = useRef<THREE.Group>();
 
         const rebuildScene = useCallback(() => {
@@ -145,30 +248,46 @@ const TwoDScene: React.FC = () => {
                 scene.add(group);
             }
 
-            // Points
-            const positions = new Float32Array(norm01.length * 3);
-            const colors = new Float32Array(norm01.length * 3);
-            for (let i = 0; i < norm01.length; i++) {
-                const p = norm01[i];
-                const z = showZ ? p.z01 : 0;
-                positions[i * 3 + 0] = p.x - 0.5;
-                positions[i * 3 + 1] = p.y - 0.5;
-                positions[i * 3 + 2] = z * zScale;
-                const t = z; // 0..1
-                colors[i * 3 + 0] = (40 + t * 215) / 255;
-                colors[i * 3 + 1] = (0 + t * 30) / 255;
-                colors[i * 3 + 2] = (0 + t * 25) / 255;
+            // Points (use dynamic samples so BO-added points appear)
+            const positions = new Float32Array(samples.length * 3);
+            const colors = new Float32Array(samples.length * 3);
+            const showColor = currentStep >= 1; // Step 2 in user terms
+            for (let i = 0; i < samples.length; i++) {
+                const s = samples[i];
+                const zTrue = showZ ? s.z : 0;
+                positions[i * 3 + 0] = s.x - 0.5;
+                positions[i * 3 + 1] = s.y - 0.5;
+                positions[i * 3 + 2] = worldZ(zTrue);
+                if (showColor) {
+                    const t = Math.max(0, Math.min(1, (s.z - zMin) / (zMax - zMin || 1)));
+                    colors[i * 3 + 0] = (40 + t * 215) / 255;
+                    colors[i * 3 + 1] = (0 + t * 30) / 255;
+                    colors[i * 3 + 2] = (0 + t * 25) / 255;
+                } else {
+                    colors[i * 3 + 0] = 0;
+                    colors[i * 3 + 1] = 0;
+                    colors[i * 3 + 2] = 0;
+                }
             }
             const geom = new THREE.BufferGeometry();
             geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
             geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-            const mat = new THREE.PointsMaterial({ size: 0.04, vertexColors: true, sizeAttenuation: true });
-            if (pointsRef.current) scene.remove(pointsRef.current);
-            pointsRef.current = new THREE.Points(geom, mat);
-            scene.add(pointsRef.current);
+                // Border (white, slightly larger, drawn first)
+                const borderMat = new THREE.PointsMaterial({ size: 0.055, color: 0xffffff, sizeAttenuation: true });
+                borderMat.depthWrite = false; // don't affect depth buffer
+                if (pointsBorderRef.current) scene.remove(pointsBorderRef.current);
+                pointsBorderRef.current = new THREE.Points(geom, borderMat);
+                pointsBorderRef.current.renderOrder = 1;
+                scene.add(pointsBorderRef.current);
 
-            // Triangulated surface (wireframe)
-            if (showMesh) {
+                const mat = new THREE.PointsMaterial({ size: 0.04, vertexColors: true, sizeAttenuation: true });
+                if (pointsRef.current) scene.remove(pointsRef.current);
+                pointsRef.current = new THREE.Points(geom, mat);
+                pointsRef.current.renderOrder = 2;
+                scene.add(pointsRef.current);
+
+            // Linear surface (triangulated from sample grid)
+            if (showLinear) {
                 const g = new THREE.BufferGeometry();
                 const trisPerCell = 2;
                 const cells = (rows - 1) * (cols - 1);
@@ -179,14 +298,17 @@ const TwoDScene: React.FC = () => {
                 const idx = (i: number, j: number) => j * cols + i;
                 for (let j = 0; j < rows - 1; j++) {
                     for (let i = 0; i < cols - 1; i++) {
-                        const p00 = norm01[idx(i, j)], p10 = norm01[idx(i + 1, j)], p11 = norm01[idx(i + 1, j + 1)], p01 = norm01[idx(i, j + 1)];
-                        const tri = [p00, p10, p11, p00, p11, p01] as const;
+                        const i00 = idx(i, j), i10 = idx(i + 1, j), i11 = idx(i + 1, j + 1), i01 = idx(i, j + 1);
+                        const v00 = { x: norm01[i00].x, y: norm01[i00].y, z: worldZ(gridPts[i00].z), t: norm01[i00].z01 };
+                        const v10 = { x: norm01[i10].x, y: norm01[i10].y, z: worldZ(gridPts[i10].z), t: norm01[i10].z01 };
+                        const v11 = { x: norm01[i11].x, y: norm01[i11].y, z: worldZ(gridPts[i11].z), t: norm01[i11].z01 };
+                        const v01 = { x: norm01[i01].x, y: norm01[i01].y, z: worldZ(gridPts[i01].z), t: norm01[i01].z01 };
+                        const tri = [v00, v10, v11, v00, v11, v01] as const;
                         for (const p of tri) {
-                            const z = showZ ? p.z01 : 0;
                             pos[k + 0] = p.x - 0.5;
                             pos[k + 1] = p.y - 0.5;
-                            pos[k + 2] = z * zScale;
-                            const t = z;
+                            pos[k + 2] = p.z;
+                            const t = p.t;
                             col[k + 0] = (40 + t * 215) / 255;
                             col[k + 1] = (0 + t * 30) / 255;
                             col[k + 2] = (0 + t * 25) / 255;
@@ -197,17 +319,150 @@ const TwoDScene: React.FC = () => {
                 g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
                 g.setAttribute('color', new THREE.BufferAttribute(col, 3));
                 g.computeVertexNormals();
-                const m = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, transparent: true, opacity: 0.4, side: THREE.DoubleSide });
-                if (meshRef.current) { scene.remove(meshRef.current); (meshRef.current.geometry as THREE.BufferGeometry).dispose(); (meshRef.current.material as THREE.Material).dispose(); }
-                meshRef.current = new THREE.Mesh(g, m);
-                scene.add(meshRef.current);
-            } else if (meshRef.current) {
-                scene.remove(meshRef.current);
-                (meshRef.current.geometry as THREE.BufferGeometry).dispose();
-                (meshRef.current.material as THREE.Material).dispose();
-                meshRef.current = undefined;
+                const m = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, transparent: false, opacity: 1.0, side: THREE.DoubleSide });
+                if (linearRef.current) { scene.remove(linearRef.current); (linearRef.current.geometry as THREE.BufferGeometry).dispose(); (linearRef.current.material as THREE.Material).dispose(); }
+                linearRef.current = new THREE.Mesh(g, m);
+                scene.add(linearRef.current);
+            } else if (linearRef.current) {
+                scene.remove(linearRef.current);
+                (linearRef.current.geometry as THREE.BufferGeometry).dispose();
+                (linearRef.current.material as THREE.Material).dispose();
+                linearRef.current = undefined;
             }
-        }, [norm01, showZ, showMesh, rows, cols]);
+
+            // GPR mean surface
+            if (showGPRMean && gpPred) {
+                const w = gridRes - 1, h = gridRes - 1;
+                const tris = w * h * 2;
+                const pos = new Float32Array(tris * 3 * 3);
+                const col = new Float32Array(tris * 3 * 3);
+                let k = 0;
+                const get = (i: number, j: number) => gpPred.mean[j * gridRes + i];
+                for (let j = 0; j < h; j++) {
+                    for (let i = 0; i < w; i++) {
+                        const x0 = i / w, x1 = (i + 1) / w, y0 = j / h, y1 = (j + 1) / h;
+                        const z00 = get(i, j), z10 = get(i + 1, j), z11 = get(i + 1, j + 1), z01 = get(i, j + 1);
+                        const t00 = Math.max(0, Math.min(1, (z00 - zMin) / (zMax - zMin)));
+                        const t10 = Math.max(0, Math.min(1, (z10 - zMin) / (zMax - zMin)));
+                        const t11 = Math.max(0, Math.min(1, (z11 - zMin) / (zMax - zMin)));
+                        const t01 = Math.max(0, Math.min(1, (z01 - zMin) / (zMax - zMin)));
+                        const tri = [
+                            { x: x0, y: y0, z: worldZ(z00), t: t00 }, { x: x1, y: y0, z: worldZ(z10), t: t10 }, { x: x1, y: y1, z: worldZ(z11), t: t11 },
+                            { x: x0, y: y0, z: worldZ(z00), t: t00 }, { x: x1, y: y1, z: worldZ(z11), t: t11 }, { x: x0, y: y1, z: worldZ(z01), t: t01 },
+                        ] as const;
+                        for (const p of tri) {
+                            pos[k + 0] = p.x - 0.5;
+                            pos[k + 1] = p.y - 0.5;
+                            pos[k + 2] = p.z;
+                            col[k + 0] = (40 + p.t * 215) / 255;
+                            col[k + 1] = (0 + p.t * 30) / 255;
+                            col[k + 2] = (0 + p.t * 25) / 255;
+                            k += 3;
+                        }
+                    }
+                }
+                const g = new THREE.BufferGeometry();
+                g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+                g.computeVertexNormals();
+                const m = new THREE.MeshStandardMaterial({ color: 0xffffff, vertexColors: true, transparent: false, opacity: 1.0, side: THREE.DoubleSide });
+                if (gprMeanRef.current) { scene.remove(gprMeanRef.current); (gprMeanRef.current.geometry as THREE.BufferGeometry).dispose(); (gprMeanRef.current.material as THREE.Material).dispose(); }
+                gprMeanRef.current = new THREE.Mesh(g, m);
+                scene.add(gprMeanRef.current);
+            } else if (gprMeanRef.current) {
+                scene.remove(gprMeanRef.current);
+                (gprMeanRef.current.geometry as THREE.BufferGeometry).dispose();
+                (gprMeanRef.current.material as THREE.Material).dispose();
+                gprMeanRef.current = undefined;
+            }
+
+            // GPR +/- sigma surfaces
+            if (showGPRSigma && gpPred) {
+                const w = gridRes - 1, h = gridRes - 1;
+                const tris = w * h * 2;
+                const buildSigma = (sign: 1 | -1) => {
+                    const pos = new Float32Array(tris * 3 * 3);
+                    let k = 0;
+                    const get = (i: number, j: number) => gpPred.mean[j * gridRes + i] + sign * gpPred.sigma[j * gridRes + i];
+                    for (let j = 0; j < h; j++) {
+                        for (let i = 0; i < w; i++) {
+                            const x0 = i / w, x1 = (i + 1) / w, y0 = j / h, y1 = (j + 1) / h;
+                            const p00 = get(i, j);
+                            const p10 = get(i + 1, j);
+                            const p11 = get(i + 1, j + 1);
+                            const p01 = get(i, j + 1);
+                            const tri = [
+                                { x: x0, y: y0, z: worldZ(p00) }, { x: x1, y: y0, z: worldZ(p10) }, { x: x1, y: y1, z: worldZ(p11) },
+                                { x: x0, y: y0, z: worldZ(p00) }, { x: x1, y: y1, z: worldZ(p11) }, { x: x0, y: y1, z: worldZ(p01) },
+                            ];
+                            for (const p of tri) {
+                                pos[k + 0] = p.x - 0.5;
+                                pos[k + 1] = p.y - 0.5;
+                                pos[k + 2] = p.z; // already mapped to world Z via worldZ()
+                                k += 3;
+                            }
+                        }
+                    }
+                    const g = new THREE.BufferGeometry();
+                    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                    g.computeVertexNormals();
+                    const m = new THREE.MeshStandardMaterial({ color: sign === 1 ? 0xff6666 : 0x6666ff, transparent: true, opacity: 0.25, side: THREE.DoubleSide });
+                    return new THREE.Mesh(g, m);
+                };
+                if (gprSigmaUpRef.current) { scene.remove(gprSigmaUpRef.current); (gprSigmaUpRef.current.geometry as THREE.BufferGeometry).dispose(); (gprSigmaUpRef.current.material as THREE.Material).dispose(); }
+                if (gprSigmaDnRef.current) { scene.remove(gprSigmaDnRef.current); (gprSigmaDnRef.current.geometry as THREE.BufferGeometry).dispose(); (gprSigmaDnRef.current.material as THREE.Material).dispose(); }
+                gprSigmaUpRef.current = buildSigma(1);
+                gprSigmaDnRef.current = buildSigma(-1);
+                scene.add(gprSigmaUpRef.current);
+                scene.add(gprSigmaDnRef.current);
+            } else {
+                if (gprSigmaUpRef.current) { scene.remove(gprSigmaUpRef.current); (gprSigmaUpRef.current.geometry as THREE.BufferGeometry).dispose(); (gprSigmaUpRef.current.material as THREE.Material).dispose(); gprSigmaUpRef.current = undefined; }
+                if (gprSigmaDnRef.current) { scene.remove(gprSigmaDnRef.current); (gprSigmaDnRef.current.geometry as THREE.BufferGeometry).dispose(); (gprSigmaDnRef.current.material as THREE.Material).dispose(); gprSigmaDnRef.current = undefined; }
+            }
+
+            // EI heat surface (height scaled so EI max reaches Z axis max)
+            if (showEI && eiField) {
+                const w = gridRes - 1, h = gridRes - 1;
+                const tris = w * h * 2;
+                const pos = new Float32Array(tris * 3 * 3);
+                const col = new Float32Array(tris * 3 * 3);
+                let k = 0;
+                const get = (i: number, j: number) => eiField.norm[j * gridRes + i];
+                for (let j = 0; j < h; j++) {
+                    for (let i = 0; i < w; i++) {
+                        const x0 = i / w, x1 = (i + 1) / w, y0 = j / h, y1 = (j + 1) / h;
+                        const e00 = get(i, j), e10 = get(i + 1, j), e11 = get(i + 1, j + 1), e01 = get(i, j + 1);
+                        const tri = [
+                            { x: x0, y: y0, e: e00 }, { x: x1, y: y0, e: e10 }, { x: x1, y: y1, e: e11 },
+                            { x: x0, y: y0, e: e00 }, { x: x1, y: y1, e: e11 }, { x: x0, y: y1, e: e01 },
+                        ];
+                        for (const p of tri) {
+                            pos[k + 0] = p.x - 0.5;
+                            pos[k + 1] = p.y - 0.5;
+                            pos[k + 2] = Math.max(0.001, p.e * zScale); // EI height 0..zScale
+                            // orange heat map
+                            const r = 0.6 + 0.4 * p.e;
+                            const g = 0.3 * (1 - p.e);
+                            const b = 0.05;
+                            col[k + 0] = r; col[k + 1] = g; col[k + 2] = b;
+                            k += 3;
+                        }
+                    }
+                }
+                const g = new THREE.BufferGeometry();
+                g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+                const m = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: false, opacity: 1.0, side: THREE.DoubleSide });
+                if (eiRef.current) { scene.remove(eiRef.current); (eiRef.current.geometry as THREE.BufferGeometry).dispose(); (eiRef.current.material as THREE.Material).dispose(); }
+                eiRef.current = new THREE.Mesh(g, m);
+                scene.add(eiRef.current);
+            } else if (eiRef.current) {
+                scene.remove(eiRef.current);
+                (eiRef.current.geometry as THREE.BufferGeometry).dispose();
+                (eiRef.current.material as THREE.Material).dispose();
+                eiRef.current = undefined;
+            }
+        }, [norm01, showZ, rows, cols, showLinear, gpPred, showGPRMean, showGPRSigma, gridRes, zMin, zMax, eiField, showEI]);
 
         // Render loop with optional auto-rotate (camera-based)
         useEffect(() => {
@@ -238,7 +493,7 @@ const TwoDScene: React.FC = () => {
                 }
                 // Enable OrbitControls and auto-rotation after tilt completes
                 controlsRef.current?.setEnabled(ready);
-                const autoRotate = currentStep >= 2 && ready && !draggingRef.current;
+                const autoRotate = rotateEnabled && currentStep >= 2 && ready && !draggingRef.current;
                 controlsRef.current?.setAutoRotate(autoRotate, 0.8);
                 controlsRef.current?.update();
                 rendererRef.current?.render(sceneRef.current!, cameraRef.current!);
@@ -250,12 +505,56 @@ const TwoDScene: React.FC = () => {
                 if (rafRef.current) cancelAnimationFrame(rafRef.current);
                 window.removeEventListener('resize', onResize);
             };
-        }, [rebuildScene, currentStep, userPaused, tilt]);
+        }, [rebuildScene, currentStep, rotateEnabled, tilt]);
+
+    // BO steps: add up to 4 samples at EI maxima across steps 5..8, and support scrubbing
+    const boSeqRef = useRef<Pt[]>([]); // accumulated BO additions in current session
+    useEffect(() => {
+        const base = gridPts.map(p => ({ x: p.x, y: p.y, z: p.z }));
+        const baseLen = base.length;
+        const desiredBoCount = currentStep >= 5 ? Math.min(4, currentStep - 4) : 0; // 0 for <= EI, then 1..4
+
+        // Ensure samples reflect base + prefix of BO sequence of length desiredBoCount
+        const ensureSamples = (count: number) => {
+            const prefix = boSeqRef.current.slice(0, count);
+            setSamples([...base, ...prefix]);
+        };
+
+        // If stepping back: trim BO sequence usage
+        if (samples.length !== baseLen + desiredBoCount) {
+            // If we need fewer than we have, or need to re-sync, reset to exact desired prefix
+            if (desiredBoCount <= boSeqRef.current.length) {
+                ensureSamples(desiredBoCount);
+                return;
+            }
+        }
+
+        // If we need to generate more BO points, do it iteratively one at a time
+        const need = desiredBoCount - boSeqRef.current.length;
+        if (need > 0 && eiField) {
+            // Pick current EI argmax
+            let bestI = 0;
+            for (let i = 1; i < eiField.norm.length; i++) if (eiField.norm[i] > eiField.norm[bestI]) bestI = i;
+            const i = bestI % gridRes;
+            const j = Math.floor(bestI / gridRes);
+            const x = i / (gridRes - 1);
+            const y = j / (gridRes - 1);
+            const z = toyFunction2D(x, y);
+            boSeqRef.current = [...boSeqRef.current, { x, y, z }];
+            ensureSamples(boSeqRef.current.length);
+        }
+
+        // If user rewinds before EI, clear sequence
+        if (currentStep < 5 && boSeqRef.current.length) {
+            boSeqRef.current = [];
+            ensureSamples(0);
+        }
+    }, [currentStep, eiField, gridPts, gridRes, samples.length]);
 
     return (
         <div className="two-d-scene" style={{ cursor: 'default' }}>
             <h2>2D Design Space</h2>
-            <p style={{ fontSize: '0.85rem', color: '#666' }}>Click canvas or use timeline. Step {currentStep}/{TOTAL_STEPS - 1}</p>
+            <p style={{ fontSize: '0.85rem', color: '#666' }}>Click canvas or use timeline. Step {currentStep + 1}/{TOTAL_STEPS}</p>
             <div style={{ width: '100%', margin: '0 0 0.5rem 0' }}>
                 <div onClick={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()} style={{ width: '100%' }}>
                     <TimelineScrubber
@@ -269,9 +568,37 @@ const TwoDScene: React.FC = () => {
             <div
                 ref={containerRef}
                 style={{ width: 800, height: 480, background: '#fafafa', border: '1px solid #ccc', cursor: 'pointer' }}
-                onClick={() => { setUserPaused(false); handleAdvance(); }}
-                onPointerDown={() => setUserPaused(true)}
+                onPointerDown={(e) => {
+                    setUserPaused(true);
+                    pointerMovedRef.current = false;
+                    pointerDownRef.current = { x: e.clientX, y: e.clientY };
+                }}
+                onPointerMove={(e) => {
+                    if (!pointerDownRef.current) return;
+                    const dx = e.clientX - pointerDownRef.current.x;
+                    const dy = e.clientY - pointerDownRef.current.y;
+                    if (Math.hypot(dx, dy) > 5) pointerMovedRef.current = true; // small threshold
+                }}
+                onPointerUp={() => {
+                    const wasDrag = pointerMovedRef.current || draggingRef.current;
+                    pointerDownRef.current = null;
+                    if (!wasDrag) { setUserPaused(false); handleAdvance(); }
+                }}
             />
+            <div style={{ marginTop: 8, display: 'flex', gap: 16, fontSize: 13 }}>
+                <label><input type="checkbox" checked={showLinear} onChange={e => setShowLinear(e.target.checked)} /> Linear</label>
+                <label><input type="checkbox" checked={!!showGPRMean} onChange={e => setShowGPRMean(e.target.checked)} /> GPR mean</label>
+                <label><input type="checkbox" checked={!!showGPRSigma} onChange={e => setShowGPRSigma(e.target.checked)} /> GPR ± σ</label>
+                <label><input type="checkbox" checked={!!showEI} onChange={e => setShowEI(e.target.checked)} /> EI</label>
+                <label>
+                    <input
+                        type="checkbox"
+                        checked={rotateEnabled}
+                        onChange={e => { userSetRotateRef.current = true; setRotateEnabled(e.target.checked); }}
+                    />
+                    {' '}rotate
+                </label>
+            </div>
         </div>
     );
 };
