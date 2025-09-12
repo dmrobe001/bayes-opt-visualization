@@ -9,7 +9,7 @@ import { GaussianProcessRegression } from '../../algorithms/gpr/gpr';
 type Pt = { x: number; y: number; z: number };
 
 const TRANS_MS = 500;
-const TOTAL_STEPS = 9; // 0:Factorial, 1:Initial, 2:Linear, 3:GPR, 4:EI, 5:BO 1, 6:BO 2, 7:BO 3, 8:BO 4
+const TOTAL_STEPS = 12; // 0:Factorial, 1:Initial, 2:Linear, 3:GPR, 4:EI, 5:BO 1, 6:BO 2, 7:BO 3, 8:BO 4, 9:Random Sampling, 10:minimax, 11:measured
 
 const TwoDScene: React.FC = () => {
     const { currentStep, nextStep, setCurrentStep } = usePresentation(TOTAL_STEPS);
@@ -69,11 +69,18 @@ const TwoDScene: React.FC = () => {
         // 2: Linear -> linear only
         // 3: GPR -> GPR mean + sigma
         // 4: EI -> sigma + EI (mean hidden)
-        // 5: BO 1 -> sigma + EI (updated after new sample)
-        setShowLinear(currentStep === 2);
-        setShowGPRMean(currentStep === 3);
-        setShowGPRSigma(currentStep >= 3);
-        setShowEI(currentStep >= 4);
+        // 5..8: BO -> GPR mean + sigma (EI hidden)
+        // 9: Random Sampling -> GPR mean + sigma
+        // 10: minimax -> no surfaces
+        // 11: measured -> GPR mean + sigma
+        const isBO = currentStep >= 5 && currentStep <= 8;
+        const isRandom = currentStep === 9;
+        const isMinimax = currentStep === 10;
+        const isMeasured = currentStep === 11;
+        setShowLinear(currentStep === 2 && !isMinimax);
+        setShowGPRMean(currentStep === 3 || isBO || isRandom || isMeasured);
+        setShowGPRSigma((currentStep >= 3 && !isMinimax) || isRandom || isMeasured);
+        setShowEI(currentStep === 4 && !isMinimax);
     }, [currentStep]);
 
     // Rotate toggle: user-controlled, with step-based auto-enable
@@ -170,14 +177,19 @@ const TwoDScene: React.FC = () => {
         'BO 1',
         'BO 2',
         'BO 3',
-        'BO 4',
+    'BO 4',
+    'Random Sampling',
+    'minimax',
+    'measured',
     ];
 
         const handleAdvance = () => { setUserPaused(false); nextStep(); };
 
         // Three.js scene setup
     const pointsRef = useRef<THREE.Points>();
-        const pointsBorderRef = useRef<THREE.Points>();
+    const pointsBorderRef = useRef<THREE.Points>();
+    const minimaxAllRef = useRef<Pt[] | null>(null);
+    const minimaxKeepIdxRef = useRef<Set<number> | null>(null);
     const linearRef = useRef<THREE.Mesh>();
     const gprMeanRef = useRef<THREE.Mesh>();
     const gprSigmaUpRef = useRef<THREE.Mesh>();
@@ -248,25 +260,51 @@ const TwoDScene: React.FC = () => {
                 scene.add(group);
             }
 
-            // Points (use dynamic samples so BO-added points appear)
-            const positions = new Float32Array(samples.length * 3);
-            const colors = new Float32Array(samples.length * 3);
-            const showColor = currentStep >= 1; // Step 2 in user terms
-            for (let i = 0; i < samples.length; i++) {
-                const s = samples[i];
-                const zTrue = showZ ? s.z : 0;
-                positions[i * 3 + 0] = s.x - 0.5;
-                positions[i * 3 + 1] = s.y - 0.5;
-                positions[i * 3 + 2] = worldZ(zTrue);
-                if (showColor) {
-                    const t = Math.max(0, Math.min(1, (s.z - zMin) / (zMax - zMin || 1)));
-                    colors[i * 3 + 0] = (40 + t * 215) / 255;
-                    colors[i * 3 + 1] = (0 + t * 30) / 255;
-                    colors[i * 3 + 2] = (0 + t * 25) / 255;
-                } else {
-                    colors[i * 3 + 0] = 0;
-                    colors[i * 3 + 1] = 0;
-                    colors[i * 3 + 2] = 0;
+            // Points (default: use dynamic samples so BO/random/measured points appear)
+            let positions: Float32Array;
+            let colors: Float32Array;
+            const showColor = currentStep >= 1; // red shading when true
+            const isMinimaxStep = currentStep === 10;
+            if (!isMinimaxStep) {
+                positions = new Float32Array(samples.length * 3);
+                colors = new Float32Array(samples.length * 3);
+                for (let i = 0; i < samples.length; i++) {
+                    const s = samples[i];
+                    const zTrue = showZ ? s.z : 0;
+                    positions[i * 3 + 0] = s.x - 0.5;
+                    positions[i * 3 + 1] = s.y - 0.5;
+                    positions[i * 3 + 2] = worldZ(zTrue);
+                    if (showColor) {
+                        const t = Math.max(0, Math.min(1, (s.z - zMin) / (zMax - zMin || 1)));
+                        colors[i * 3 + 0] = (40 + t * 215) / 255;
+                        colors[i * 3 + 1] = (0 + t * 30) / 255;
+                        colors[i * 3 + 2] = (0 + t * 25) / 255;
+                    } else {
+                        colors[i * 3 + 0] = 0;
+                        colors[i * 3 + 1] = 0;
+                        colors[i * 3 + 2] = 0;
+                    }
+                }
+            } else {
+                // minimax: draw 80 grey points on plane, survivors black
+                const all = minimaxAllRef.current ?? [];
+                const keep = minimaxKeepIdxRef.current ?? new Set<number>();
+                positions = new Float32Array(all.length * 3);
+                colors = new Float32Array(all.length * 3);
+                for (let i = 0; i < all.length; i++) {
+                    const p = all[i];
+                    positions[i * 3 + 0] = p.x - 0.5;
+                    positions[i * 3 + 1] = p.y - 0.5;
+                    positions[i * 3 + 2] = 0; // on plane
+                    if (keep.has(i)) {
+                        colors[i * 3 + 0] = 0;
+                        colors[i * 3 + 1] = 0;
+                        colors[i * 3 + 2] = 0;
+                    } else {
+                        colors[i * 3 + 0] = 0.7;
+                        colors[i * 3 + 1] = 0.7;
+                        colors[i * 3 + 2] = 0.7;
+                    }
                 }
             }
             const geom = new THREE.BufferGeometry();
@@ -510,9 +548,10 @@ const TwoDScene: React.FC = () => {
     // BO steps: add up to 4 samples at EI maxima across steps 5..8, and support scrubbing
     const boSeqRef = useRef<Pt[]>([]); // accumulated BO additions in current session
     useEffect(() => {
+        if (currentStep >= 9) return; // handled by random sampling logic below
         const base = gridPts.map(p => ({ x: p.x, y: p.y, z: p.z }));
         const baseLen = base.length;
-        const desiredBoCount = currentStep >= 5 ? Math.min(4, currentStep - 4) : 0; // 0 for <= EI, then 1..4
+        const desiredBoCount = currentStep >= 5 && currentStep <= 8 ? Math.min(4, currentStep - 4) : 0; // only for steps 5..8
 
         // Ensure samples reflect base + prefix of BO sequence of length desiredBoCount
         const ensureSamples = (count: number) => {
@@ -550,6 +589,62 @@ const TwoDScene: React.FC = () => {
             ensureSamples(0);
         }
     }, [currentStep, eiField, gridPts, gridRes, samples.length]);
+
+    // Random Sampling step (step 9): start over with 16 random samples
+    const randomSamplesRef = useRef<Pt[] | null>(null);
+    useEffect(() => {
+        if (currentStep === 9) {
+            if (!randomSamplesRef.current) {
+                const rng = Math.random;
+                const pts: Pt[] = [];
+                const n = 16;
+                for (let k = 0; k < n; k++) {
+                    const x = rng();
+                    const y = rng();
+                    const z = toyFunction2D(x, y);
+                    pts.push({ x, y, z });
+                }
+                randomSamplesRef.current = pts;
+            }
+            setSamples(randomSamplesRef.current.slice());
+        }
+        // If moving away from random step to earlier stages, BO and base logic will take over
+    }, [currentStep]);
+
+    // Minimax generation (step 10) and measured samples (step 11)
+    useEffect(() => {
+        if (currentStep === 10) {
+            if (!minimaxAllRef.current || !minimaxKeepIdxRef.current) {
+                // Generate 80 random XY points
+                const rng = Math.random;
+                const all: Pt[] = [];
+                for (let k = 0; k < 80; k++) { all.push({ x: rng(), y: rng(), z: 0 }); }
+                // Downsample by repeatedly removing the closest pair until 16 remain
+                const indices = Array.from({ length: all.length }, (_, i) => i);
+                while (indices.length > 16) {
+                    let bestA = 0, bestB = 1; let bestD = Infinity;
+                    for (let a = 0; a < indices.length; a++) {
+                        const ia = indices[a]; const ax = all[ia].x, ay = all[ia].y;
+                        for (let b = a + 1; b < indices.length; b++) {
+                            const ib = indices[b]; const dx = ax - all[ib].x, dy = ay - all[ib].y; const d = dx * dx + dy * dy;
+                            if (d < bestD) { bestD = d; bestA = a; bestB = b; }
+                        }
+                    }
+                    const hi = Math.max(bestA, bestB), lo = Math.min(bestA, bestB);
+                    indices.splice(hi, 1); indices.splice(lo, 1);
+                }
+                minimaxAllRef.current = all;
+                minimaxKeepIdxRef.current = new Set(indices);
+            }
+        } else if (currentStep === 11) {
+            // Use minimax survivors as measured samples with true z
+            if (minimaxAllRef.current && minimaxKeepIdxRef.current) {
+                const survivors = Array.from(minimaxKeepIdxRef.current).map(i => minimaxAllRef.current![i]);
+                const smp = survivors.map(p => ({ x: p.x, y: p.y, z: toyFunction2D(p.x, p.y) }));
+                setSamples(smp);
+            }
+        }
+    }, [currentStep]);
 
     return (
         <div className="two-d-scene" style={{ cursor: 'default' }}>
