@@ -8,7 +8,7 @@ const Layout: React.FC = ({ children }) => {
             </header>
             <main>{children}</main>
             <footer>
-                <p>&copy; {new Date().getFullYear()} Bayesian Optimization Team</p>
+                {/*<p>&copy; {new Date().getFullYear()} Bayesian Optimization Team</p> */}
             </footer>
         </div>
     );
