@@ -9,7 +9,7 @@ import { GaussianProcessRegression } from '../../algorithms/gpr/gpr';
 type Pt = { x: number; y: number; z: number };
 
 const TRANS_MS = 500;
-const TOTAL_STEPS = 12; // 0:Factorial, 1:Initial, 2:Linear, 3:GPR, 4:EI, 5:BO 1, 6:BO 2, 7:BO 3, 8:BO 4, 9:Random Sampling, 10:minimax, 11:measured
+const TOTAL_STEPS = 16; // 0:Factorial, 1:Initial, 2:Linear, 3:GPR, 4:EI, 5:BO 1, 6:BO 2, 7:BO 3, 8:BO 4, 9:Random, 10:minimax, 11:measured, 12..15:m-BO 1..4
 
 const TwoDScene: React.FC = () => {
     const { currentStep, nextStep, setCurrentStep } = usePresentation(TOTAL_STEPS);
@@ -72,15 +72,17 @@ const TwoDScene: React.FC = () => {
         // 5..8: BO -> GPR mean + sigma (EI hidden)
         // 9: Random Sampling -> GPR mean + sigma
         // 10: minimax -> no surfaces
-        // 11: measured -> GPR mean + sigma
-        const isBO = currentStep >= 5 && currentStep <= 8;
+    // 11: measured -> GPR mean + sigma
+    // 12..15: m-BO -> GPR mean + sigma (EI hidden)
+    const isBO = currentStep >= 5 && currentStep <= 8;
         const isRandom = currentStep === 9;
         const isMinimax = currentStep === 10;
-        const isMeasured = currentStep === 11;
-        setShowLinear(currentStep === 2 && !isMinimax);
-        setShowGPRMean(currentStep === 3 || isBO || isRandom || isMeasured);
-        setShowGPRSigma((currentStep >= 3 && !isMinimax) || isRandom || isMeasured);
-        setShowEI(currentStep === 4 && !isMinimax);
+    const isMeasured = currentStep === 11;
+    const isMBO = currentStep >= 12 && currentStep <= 15;
+    setShowLinear(currentStep === 2 && !isMinimax);
+    setShowGPRMean(currentStep === 3 || isBO || isRandom || isMeasured || isMBO);
+    setShowGPRSigma((currentStep >= 3 && !isMinimax) || isRandom || isMeasured || isMBO);
+    setShowEI(currentStep === 4 && !isMinimax);
     }, [currentStep]);
 
     // Rotate toggle: user-controlled, with step-based auto-enable
@@ -181,6 +183,10 @@ const TwoDScene: React.FC = () => {
     'Random Sampling',
     'minimax',
     'measured',
+    'm-BO 1',
+    'm-BO 2',
+    'm-BO 3',
+    'm-BO 4',
     ];
 
         const handleAdvance = () => { setUserPaused(false); nextStep(); };
@@ -265,6 +271,7 @@ const TwoDScene: React.FC = () => {
             let colors: Float32Array;
             const showColor = currentStep >= 1; // red shading when true
             const isMinimaxStep = currentStep === 10;
+            const forceBlack = currentStep >= 11; // measured and m-BO: black points
             if (!isMinimaxStep) {
                 positions = new Float32Array(samples.length * 3);
                 colors = new Float32Array(samples.length * 3);
@@ -274,7 +281,9 @@ const TwoDScene: React.FC = () => {
                     positions[i * 3 + 0] = s.x - 0.5;
                     positions[i * 3 + 1] = s.y - 0.5;
                     positions[i * 3 + 2] = worldZ(zTrue);
-                    if (showColor) {
+                    if (forceBlack) {
+                        colors[i * 3 + 0] = 0; colors[i * 3 + 1] = 0; colors[i * 3 + 2] = 0;
+                    } else if (showColor) {
                         const t = Math.max(0, Math.min(1, (s.z - zMin) / (zMax - zMin || 1)));
                         colors[i * 3 + 0] = (40 + t * 215) / 255;
                         colors[i * 3 + 1] = (0 + t * 30) / 255;
@@ -548,7 +557,7 @@ const TwoDScene: React.FC = () => {
     // BO steps: add up to 4 samples at EI maxima across steps 5..8, and support scrubbing
     const boSeqRef = useRef<Pt[]>([]); // accumulated BO additions in current session
     useEffect(() => {
-        if (currentStep >= 9) return; // handled by random sampling logic below
+        if (currentStep >= 9) return; // don't override Random/Minimax/Measured/m-BO
         const base = gridPts.map(p => ({ x: p.x, y: p.y, z: p.z }));
         const baseLen = base.length;
         const desiredBoCount = currentStep >= 5 && currentStep <= 8 ? Math.min(4, currentStep - 4) : 0; // only for steps 5..8
@@ -608,7 +617,7 @@ const TwoDScene: React.FC = () => {
             }
             setSamples(randomSamplesRef.current.slice());
         }
-        // If moving away from random step to earlier stages, BO and base logic will take over
+        // No action in other steps here to avoid clobbering samples
     }, [currentStep]);
 
     // Minimax generation (step 10) and measured samples (step 11)
@@ -637,14 +646,63 @@ const TwoDScene: React.FC = () => {
                 minimaxKeepIdxRef.current = new Set(indices);
             }
         } else if (currentStep === 11) {
-            // Use minimax survivors as measured samples with true z
-            if (minimaxAllRef.current && minimaxKeepIdxRef.current) {
-                const survivors = Array.from(minimaxKeepIdxRef.current).map(i => minimaxAllRef.current![i]);
-                const smp = survivors.map(p => ({ x: p.x, y: p.y, z: toyFunction2D(p.x, p.y) }));
-                setSamples(smp);
+            // Ensure minimax survivors exist; if not, generate them now
+            if (!minimaxAllRef.current || !minimaxKeepIdxRef.current) {
+                const rng = Math.random;
+                const all: Pt[] = [];
+                for (let k = 0; k < 80; k++) { all.push({ x: rng(), y: rng(), z: 0 }); }
+                const indices = Array.from({ length: all.length }, (_, i) => i);
+                while (indices.length > 16) {
+                    let bestA = 0, bestB = 1; let bestD = Infinity;
+                    for (let a = 0; a < indices.length; a++) {
+                        const ia = indices[a]; const ax = all[ia].x, ay = all[ia].y;
+                        for (let b = a + 1; b < indices.length; b++) {
+                            const ib = indices[b]; const dx = ax - all[ib].x, dy = ay - all[ib].y; const d = dx * dx + dy * dy;
+                            if (d < bestD) { bestD = d; bestA = a; bestB = b; }
+                        }
+                    }
+                    const hi = Math.max(bestA, bestB), lo = Math.min(bestA, bestB);
+                    indices.splice(hi, 1); indices.splice(lo, 1);
+                }
+                minimaxAllRef.current = all;
+                minimaxKeepIdxRef.current = new Set(indices);
             }
+            // Use minimax survivors as measured samples with true z
+            const survivors = Array.from(minimaxKeepIdxRef.current!).map(i => minimaxAllRef.current![i]);
+            const smp = survivors.map(p => ({ x: p.x, y: p.y, z: toyFunction2D(p.x, p.y) }));
+            setSamples(smp);
+        } else if (currentStep < 11 || currentStep > 15) {
+            // Leaving measured/m-BO range: clear m-BO sequence to avoid carry-over
+            mboSeqRef.current = [];
         }
-    }, [currentStep]);
+    }, [currentStep, samples.length]);
+
+    // m-BO steps (12..15): add up to 4 points by EI starting from minimax survivors, with scrubbing support
+    const mboSeqRef = useRef<Pt[]>([]);
+    useEffect(() => {
+        if (currentStep < 12 || currentStep > 15) return;
+        // Base = measured survivors
+        if (!(minimaxAllRef.current && minimaxKeepIdxRef.current)) return;
+        const survivors = Array.from(minimaxKeepIdxRef.current).map(i => minimaxAllRef.current![i]);
+        const base = survivors.map(p => ({ x: p.x, y: p.y, z: toyFunction2D(p.x, p.y) }));
+        const desired = currentStep - 11; // 1..4
+        const currentAdded = mboSeqRef.current.slice(0, desired);
+        const targetLen = base.length + currentAdded.length;
+        // Only set samples if count differs to avoid render thrash
+        if (samples.length !== targetLen) {
+            setSamples([...base, ...currentAdded]);
+        }
+        // If we need to generate a new point for this step, do it once when EI is ready
+        const need = desired - mboSeqRef.current.length;
+        if (need > 0 && eiField) {
+            let bestI = 0;
+            for (let i = 1; i < eiField.norm.length; i++) if (eiField.norm[i] > eiField.norm[bestI]) bestI = i;
+            const i = bestI % gridRes; const j = Math.floor(bestI / gridRes);
+            const x = i / (gridRes - 1); const y = j / (gridRes - 1); const z = toyFunction2D(x, y);
+            mboSeqRef.current = [...mboSeqRef.current, { x, y, z }];
+            setSamples([...base, ...mboSeqRef.current.slice(0, desired)]);
+        }
+    }, [currentStep, eiField, gridRes, samples.length]);
 
     return (
         <div className="two-d-scene" style={{ cursor: 'default' }}>
