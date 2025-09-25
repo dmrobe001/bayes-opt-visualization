@@ -1,1 +1,0 @@
-// This file contains the sequence of steps for the 3D scene presentation.
